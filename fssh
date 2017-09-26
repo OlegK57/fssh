@@ -1,0 +1,255 @@
+#!/bin/bash
+
+all_args=${@}
+target=${1}
+server_tags=(${@:2})
+
+ssh_key_path=${FSSH_KEY_DIR:-~/.ssh/pem}
+ssh_options=${FSSH_OPTIONS:-"-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"}
+ssh_binary=${FSSH_SSH:-"/usr/bin/ssh"}
+
+do_api_url="https://api.digitalocean.com/v2"
+
+function log {
+  echo "[$(date +%Y-%m-%dT%T%z)] [SSH] $*"
+}
+function log_error {
+  log "[ERROR] $*"
+}
+function log_warning {
+  log "[WARN] $*"
+}
+function log_info {
+  log "[INFO] $*"
+}
+function log_debug {
+  if [[ $FSSH_DEBUG ]]
+  then
+    log "[DEBUG] $*"
+  fi
+}
+
+function validate_ip()
+{
+    # IP Address to validate
+    local ip=$1
+    # Boolean to exit the script
+    local exit_ssh=$2
+    local stat=0
+
+    # Check if valid IP
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]
+    then
+      OIFS=$IFS
+      IFS='.'
+      octets=($ip)
+      IFS=$OIFS
+      # Check if all octet are valid
+      for octet in ${octets[@]}
+      do
+        if [[ ${octet} -ge 0 && ${octet} -le 255 ]]
+        then
+          stat=$(($? + $stat))
+        fi
+      done
+    else
+      stat=1
+    fi
+    if [[ ${stat} -ne 0 ]]
+    then
+      if [[ ! ${exit_ssh} ]]
+      then
+        log_error "Got incorrect IP, probably can't find the server: ${ip}"
+        exit ${stat}
+      else
+        echo ${stat}
+      fi
+    fi
+    if [[ ${exit_ssh} ]]
+    then
+      echo 0
+    fi
+}
+
+function get_do_host()
+{
+  local tags=($@)
+  droplets=$(curl -s -X GET -H "Content-Type: application/json" -H "Authorization: Bearer ${DO_API_KEY}" "${do_api_url}/droplets?tag_name=${tags[0]}")
+  for (( i=1; i<${#tags[@]}+1; i++ ))
+  do
+    if [[ $(echo ${droplets} | jq '.droplets | length') != 1 ]]
+    then
+      droplets=$(echo ${droplets} | jq --arg tag "${tags[${i}]}" '.droplets[] | select(.tags[] | contains($tag)) |  {"droplets": [.]}')
+    else
+      echo ${droplets} | jq '.droplets[]'
+      return 0
+    fi
+  done
+  echo "{}"
+}
+function get_do_user()
+{
+  local os=$1
+  case ${os} in
+    "CoreOS")
+      echo "core"
+      ;;
+    *)
+      whoami
+      ;;
+  esac
+}
+
+function aws_get_region()
+{
+  local found=1
+  for (( i=0; i<${#server_tags[@]}+1; i++ ))
+  do
+    local element=${server_tags[${i}]}
+    if [[ ${element} =~ ^..-(east|west|central|south|northeast|southeast)-.$ ]]
+    then
+      aws_region=${element}
+      delete=(${aws_region})
+      server_tags=(${server_tags[@]/$delete})
+    fi
+  done
+  if [[ ! ${aws_region} ]]
+  then
+    log_warning "No AWS Region was provided, using profile default"
+    aws_region=$(aws configure --profile ${profile} get region)
+    if [[ ! ${aws_region} ]]
+    then
+      log_error "${profile} profile has no default profile, can't continue"
+      exit 988
+    fi
+  fi
+  log_debug "Looking for server in ${aws_region} AWS region"
+}
+function aws_get_host()
+{
+  for (( i=0; i<${#server_tags[@]}+1; i++ ))
+  do
+    local tag=${server_tags[${i}]}
+    if [[ ${tag} =~ ^i-(.{17}|.{8})$ ]]
+    then
+      log_debug "Looking for instace using ID: ${tag}"
+      server=$(aws --profile ${profile} --region ${aws_region} ec2 describe-instances --instance-ids ${tag} 2>/dev/null)
+    fi
+  done
+  if [[ ! ${server} ]]
+  then
+    log_error "Instance wasn't not found, make sure you're using write profile/region/tags"
+    exit 989
+  fi
+}
+function aws_get_user_from_ami()
+{
+  ami_name=$(aws --profile ${profile} --region ${aws_region} ec2 describe-images --image-ids ${ami_id} | jq -r .Images[0].Name)
+  case ${ami_name} in
+  *amzn*)
+    ssh_user="ec2-user"
+    ;;
+  *ubuntu*)
+    ssh_user="ubuntu"
+    ;;
+  *CentOS*)
+    ssh_user="root"
+    ;;
+  *DataSax*)
+    ssh_user="ubuntu"
+    ;;
+  *CoreOS*)
+    ssh_user="core"
+    ;;
+  esac
+}
+function aws_check_profile()
+{
+  aws configure --profile ${profile} list > /dev/null 2>&1
+  if [[ $? != 0 ]]
+  then
+    log_warning "Unkown AWS profile, using default"
+    profile="default"
+    aws configure --profile ${profile} list > /dev/null 2>&1
+    if [[ $? != 0 ]]
+    then
+      log_error "Default profile is not set, can't continue"
+      exit 987
+    fi
+  fi
+}
+
+case ${target} in
+  "aws")
+    aws_region=""
+    profile=${server_tags[0]}
+    delete=(${profile})
+    server_tags=(${server_tags[@]/$delete})
+    aws_check_profile
+    aws_get_region
+    aws_get_host
+    key_name=$(echo ${server} | jq -r .Reservations[0].Instances[0].KeyName)
+    private_ip=$(echo ${server} | jq -r .Reservations[0].Instances[0].PrivateIpAddress)
+    public_ip=$(echo ${server} | jq -r .Reservations[0].Instances[0].PublicIpAddress)
+    ami_id=$(echo ${server} | jq -r .Reservations[0].Instances[0].ImageId)
+    ami_name=""
+    log_info "Found server in AWS with key:${key_name}, PrivateIP:${private_ip}, PublicIP:${public_ip}, AMI:${ami_id}"
+    if [[ $(validate_ip "${private_ip}" "false") != "0" ]]
+    then
+      log_warning "No private IP assign to server, using public IP"
+      validate_ip ${public_ip}
+      server_ip=${public_ip}
+    else
+      if nc -z -w5 ${private_ip} 22 2>/dev/null
+      then
+        log_debug "Have connection to private IP ${private_ip}"
+        validate_ip ${private_ip}
+        server_ip=${private_ip}
+      else
+        log_error "No connection to private IP ${private_ip}"
+        server_ip=${public_ip}
+      fi
+    fi
+    validate_ip ${server_ip}
+    key_path=${ssh_key_path}/${profile}/${key_name}.pem
+    ssh_user=""
+    if [[ -f ${key_path} ]]
+    then
+      log_debug "Found pem key at ${key_path}, looking for user"
+      aws_get_user_from_ami
+      if [[ ! ${ssh_user} ]]
+      then
+        log_info "Couldn't find user from server AMI ${ami_name} (${ami_id}), trying to SSH as root"
+        status=$(ssh -o BatchMode=yes -o ConnectTimeout=1 ${ssh_options} -i ${key_path} -l root ${server_ip} echo ok 2>/dev/null)
+        if [[ ${status} =~ .*user.\"(.*)\".rather.* ]]
+        then
+          ssh_user=${BASH_REMATCH[1]}
+        elif [[ ${status} =~ ok ]]
+        then
+          ssh_user="root"
+        fi
+      fi
+      if [[ ${ssh_user} ]]
+      then
+        log_info "Establishing connection using ${ssh_user} user"
+        ${ssh_binary} ${ssh_options} -i ${key_path} -l ${ssh_user} ${server_ip}
+      else
+        log_error "Failed to find SSH user"
+        exit 990
+      fi
+    else
+      log_error "Missing pem file ${key_path}"
+      exit 991
+    fi
+    ;;
+  "do"|"digitalocean")
+    droplet=$(get_do_host ${server_tags[@]})
+    ssh_user=$(get_do_user $(echo ${droplet} | jq -r '.image.distribution'))
+    server_ip=$(echo ${droplet} | jq -r '.networks.v4[] | select(.type=="public") | .ip_address')
+    validate_ip ${server_ip}
+    ${ssh_binary} ${ssh_options} -l ${ssh_user} ${server_ip}
+    ;;
+  *)
+    ${ssh_binary} ${ssh_options} ${all_args}
+    ;;
+esac
